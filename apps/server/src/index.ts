@@ -2,6 +2,11 @@ import "./load-env";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import path from "node:path";
+import {
+  assemblySpeakerToNumber,
+  diarizeWithAssemblyAI,
+  formatSpeakersTxt,
+} from "./assemblyai-diarize";
 import { defaultRecordingsDir } from "./paths";
 import { env } from "@my-better-t-app/env/server";
 import cors from "cors";
@@ -39,20 +44,9 @@ type AudioSession = {
   totalBytes: number;
   lastSeq: number;
   buffers: Buffer[];
-  /** Text from Web Speech `isFinal` segments. */
-  transcriptCommitted: string;
-  /** Latest non-final (interim) text — browsers often never send finals before stop. */
-  transcriptInterim: string;
 };
 
 const sessions = new Map<string, AudioSession>();
-
-function transcriptToSave(session: AudioSession): string {
-  const parts = [session.transcriptCommitted, session.transcriptInterim]
-    .map((s) => s.trim())
-    .filter(Boolean);
-  return parts.join(" ").trim();
-}
 
 function extFromMime(mime?: string): string {
   if (!mime) {
@@ -78,6 +72,15 @@ app.get("/", (_req, res) => {
   res.type("text/plain").send("OK");
 });
 
+/** Public feature flags for the web app (no secrets). */
+app.get("/capabilities", (_req, res) => {
+  const hasKey = Boolean(env.ASSEMBLYAI_API_KEY);
+  res.json({
+    assemblyAiTranscription: hasKey,
+    speakerDiarization: hasKey,
+  });
+});
+
 app.use(
   "/recordings",
   express.static(RECORDINGS_DIR, {
@@ -89,6 +92,8 @@ app.use(
         res.setHeader("Content-Type", "audio/mp4");
       } else if (filePath.endsWith(".txt")) {
         res.setHeader("Content-Type", "text/plain; charset=utf-8");
+      } else if (filePath.endsWith(".json")) {
+        res.setHeader("Content-Type", "application/json; charset=utf-8");
       }
     },
   }),
@@ -121,8 +126,6 @@ function handleAudioStart(
     totalBytes: 0,
     lastSeq: -1,
     buffers: [],
-    transcriptCommitted: "",
-    transcriptInterim: "",
   });
   socket.emit("audio:ack", {
     phase: "started",
@@ -245,13 +248,18 @@ function handleAudioEnd(socket: Socket, msg: { audioSessionId?: string; lastSeq?
   const audioPath = `${baseName}.${ext}`;
   const transcriptPath = `${baseName}.txt`;
 
-  const transcriptText = transcriptToSave(session);
+  const initialTranscript =
+    merged.length === 0
+      ? "No audio file was saved (0 bytes merged).\n"
+      : env.ASSEMBLYAI_API_KEY
+        ? "Transcript is processing on the server (AssemblyAI)…\n"
+        : "Transcript unavailable: set ASSEMBLYAI_API_KEY on the API server to transcribe with AssemblyAI.\n";
 
   try {
     if (merged.length > 0) {
       writeFileSync(audioPath, merged);
     }
-    writeFileSync(transcriptPath, transcriptText, "utf8");
+    writeFileSync(transcriptPath, initialTranscript, "utf8");
   } catch (e) {
     socket.emit("audio:error", {
       code: "SAVE_FAILED",
@@ -268,11 +276,15 @@ function handleAudioEnd(socket: Socket, msg: { audioSessionId?: string; lastSeq?
     audioBytes: merged.length,
     audioFile: absAudio,
     transcriptFile: absTranscript,
-    transcriptChars: transcriptText.length,
+    transcriptChars: initialTranscript.length,
   });
 
   const audioBasename = merged.length > 0 ? path.basename(audioPath) : null;
   const transcriptBasename = path.basename(transcriptPath);
+
+  const diarizationQueued = Boolean(
+    env.ASSEMBLYAI_API_KEY && merged.length > 0 && absAudio,
+  );
 
   socket.emit("audio:ack", {
     phase: "ended",
@@ -287,48 +299,81 @@ function handleAudioEnd(socket: Socket, msg: { audioSessionId?: string; lastSeq?
     savedTranscriptPath: absTranscript,
     recordingAudioUrl: audioBasename ? `/recordings/${audioBasename}` : null,
     recordingTranscriptUrl: `/recordings/${transcriptBasename}`,
+    diarizationQueued,
   });
+
+  const apiKey = env.ASSEMBLYAI_API_KEY;
+  if (apiKey && merged.length > 0 && absAudio) {
+    void scheduleAssemblyAiDiarization({
+      audioSessionId,
+      audioPath: absAudio,
+      socket,
+      apiKey,
+    });
+  }
+
   sessions.delete(audioSessionId);
 }
 
-function handleTranscript(
-  socket: Socket,
-  msg: { audioSessionId?: string; text?: string; isFinal?: boolean; seq?: number },
-): void {
-  const audioSessionId = msg.audioSessionId;
-  if (!audioSessionId || typeof msg.text !== "string") {
-    socket.emit("transcript:error", { code: "INVALID_TRANSCRIPT" });
-    return;
-  }
-  const session = sessions.get(audioSessionId);
-  if (!session) {
-    socket.emit("transcript:error", {
-      code: "UNKNOWN_AUDIO_SESSION",
+async function scheduleAssemblyAiDiarization(params: {
+  audioSessionId: string;
+  audioPath: string;
+  socket: Socket;
+  apiKey: string;
+}): Promise<void> {
+  const { audioSessionId, audioPath, socket, apiKey } = params;
+  console.log("[diarization] started", { audioSessionId });
+  try {
+    const result = await diarizeWithAssemblyAI(audioPath, apiKey);
+    const baseName = path.join(RECORDINGS_DIR, audioSessionId);
+    const jsonPath = `${baseName}.diarization.json`;
+    const speakersPath = `${baseName}.speakers.txt`;
+    const payload = {
       audioSessionId,
+      provider: "assemblyai" as const,
+      utterances: result.utterances.map((u) => ({
+        speaker: u.speaker,
+        speakerNumber: assemblySpeakerToNumber(u.speaker),
+        start: u.start,
+        end: u.end,
+        text: u.text,
+      })),
+      fullText: result.fullText,
+    };
+    writeFileSync(jsonPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+    writeFileSync(speakersPath, `${formatSpeakersTxt(result.utterances)}\n`, "utf8");
+    const transcriptPath = `${baseName}.txt`;
+    const mainText =
+      result.fullText.trim() === ""
+        ? "(AssemblyAI returned an empty transcript.)\n"
+        : `${result.fullText.trim()}\n`;
+    writeFileSync(transcriptPath, mainText, "utf8");
+    const jsonBasename = path.basename(jsonPath);
+    const speakersBasename = path.basename(speakersPath);
+    if (socket.connected) {
+      socket.emit("diarization:done", {
+        audioSessionId,
+        ok: true,
+        recordingSpeakersUrl: `/recordings/${speakersBasename}`,
+        recordingDiarizationJsonUrl: `/recordings/${jsonBasename}`,
+        utteranceCount: result.utterances.length,
+      });
+    }
+    console.log("[diarization] saved", {
+      audioSessionId,
+      utterances: result.utterances.length,
     });
-    return;
-  }
-
-  const piece = msg.text.trim();
-  if (piece !== "") {
-    if (msg.isFinal) {
-      session.transcriptCommitted =
-        session.transcriptCommitted === ""
-          ? piece
-          : `${session.transcriptCommitted} ${piece}`;
-      session.transcriptInterim = "";
-    } else {
-      session.transcriptInterim = piece;
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    console.error("[diarization] failed", { audioSessionId, message });
+    if (socket.connected) {
+      socket.emit("diarization:done", {
+        audioSessionId,
+        ok: false,
+        error: message,
+      });
     }
   }
-
-  socket.emit("transcript:ack", {
-    audioSessionId,
-    seq: msg.seq ?? 0,
-    isFinal: Boolean(msg.isFinal),
-    charLength: msg.text.length,
-    savedPreviewChars: transcriptToSave(session).length,
-  });
 }
 
 io.on("connection", (socket) => {
@@ -344,12 +389,6 @@ io.on("connection", (socket) => {
   socket.on("audio:end", (msg: { audioSessionId?: string; lastSeq?: number }) => {
     handleAudioEnd(socket, msg);
   });
-  socket.on(
-    "transcript",
-    (msg: { audioSessionId?: string; text?: string; isFinal?: boolean; seq?: number }) => {
-      handleTranscript(socket, msg);
-    },
-  );
 });
 
 server.listen(SERVER_PORT, () => {

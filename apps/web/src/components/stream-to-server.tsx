@@ -9,44 +9,12 @@ import {
   CardHeader,
   CardTitle,
 } from "@my-better-t-app/ui/components/card";
+import { cn } from "@my-better-t-app/ui/lib/utils";
 import { Loader2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { io, type Socket } from "socket.io-client";
 
 const CHUNK_INTERVAL_MS = 2000;
-
-type SpeechRecognitionLike = {
-  continuous: boolean;
-  interimResults: boolean;
-  lang: string;
-  start: () => void;
-  stop: () => void;
-  abort: () => void;
-  onresult: ((ev: SpeechRecognitionEventLike) => void) | null;
-  onerror: ((ev: SpeechRecognitionErrorLike) => void) | null;
-  onend: (() => void) | null;
-};
-
-type SpeechRecognitionEventLike = {
-  resultIndex: number;
-  results: {
-    length: number;
-    [index: number]: { isFinal: boolean; 0: { transcript: string } };
-  };
-};
-
-type SpeechRecognitionErrorLike = { error: string };
-
-function getSpeechRecognitionCtor(): (new () => SpeechRecognitionLike) | null {
-  if (typeof window === "undefined") {
-    return null;
-  }
-  const w = window as unknown as {
-    SpeechRecognition?: new () => SpeechRecognitionLike;
-    webkitSpeechRecognition?: new () => SpeechRecognitionLike;
-  };
-  return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null;
-}
 
 function blobToBase64(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -78,25 +46,112 @@ function joinApiUrl(apiBase: string, pathname: string): string {
   return `${base}${path}`;
 }
 
+type DiarizedSegment = {
+  speakerNumber: number;
+  timeRangeLabel: string;
+  text: string;
+};
+
+function assemblySpeakerToNumberClient(label: string): number {
+  const t = label.trim().toUpperCase();
+  if (/^[A-Z]$/.test(t)) {
+    return t.charCodeAt(0) - 64;
+  }
+  const digits = label.match(/\d+/);
+  if (digits) {
+    const n = Number.parseInt(digits[0], 10);
+    if (Number.isFinite(n) && n > 0) {
+      return n;
+    }
+  }
+  return 1;
+}
+
+function segmentsFromDiarizationJson(data: unknown): DiarizedSegment[] | null {
+  if (!data || typeof data !== "object" || !("utterances" in data)) {
+    return null;
+  }
+  const raw = (data as { utterances?: unknown }).utterances;
+  if (!Array.isArray(raw)) {
+    return null;
+  }
+  const out: DiarizedSegment[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const o = item as {
+      text?: unknown;
+      start?: unknown;
+      end?: unknown;
+      speaker?: unknown;
+      speakerNumber?: unknown;
+    };
+    if (typeof o.text !== "string") {
+      continue;
+    }
+    const startMs = typeof o.start === "number" ? o.start : 0;
+    const endMs = typeof o.end === "number" ? o.end : 0;
+    const speakerNumber =
+      typeof o.speakerNumber === "number" && o.speakerNumber > 0
+        ? o.speakerNumber
+        : typeof o.speaker === "string"
+          ? assemblySpeakerToNumberClient(o.speaker)
+          : 1;
+    const t0 = (startMs / 1000).toFixed(1);
+    const t1 = (endMs / 1000).toFixed(1);
+    out.push({
+      speakerNumber,
+      timeRangeLabel: `${t0}s–${t1}s`,
+      text: o.text.trim(),
+    });
+  }
+  return out.length > 0 ? out : null;
+}
+
+type CapabilitiesState =
+  | { status: "loading" }
+  | { status: "error"; message: string }
+  | { status: "ready"; assemblyAiEnabled: boolean };
+
 export default function StreamToServer() {
+  const [capabilities, setCapabilities] = useState<CapabilitiesState>({
+    status: "loading",
+  });
+
   const [ready, setReady] = useState(false);
   const [streaming, setStreaming] = useState(false);
   const [socketLine, setSocketLine] = useState("Idle.");
-  const [committedTranscript, setCommittedTranscript] = useState("");
-  const [interimTranscript, setInterimTranscript] = useState("");
-  const [speechOk, setSpeechOk] = useState(false);
   const [chunkCount, setChunkCount] = useState(0);
   const [localChunkCount, setLocalChunkCount] = useState(0);
   /**
-   * After Stop: true until server merge + save completes and final transcript is fetched.
-   * No live merged audio preview — only this gate before showing final URLs + player.
+   * After Stop: true until server merge completes and the initial transcript file is fetched.
    */
   const [isProcessingFinal, setIsProcessingFinal] = useState(false);
   const [savedRecording, setSavedRecording] = useState<{
     audioUrl: string | null;
     transcriptUrl: string;
+    audioSessionId: string;
   } | null>(null);
   const [savedTranscriptText, setSavedTranscriptText] = useState<string | null>(null);
+
+  type DiarizationUi =
+    | { kind: "none" }
+    | { kind: "pending" }
+    | {
+        kind: "ready";
+        speakersUrl: string;
+        jsonUrl: string;
+        speakersText: string | null;
+        segments: DiarizedSegment[] | null;
+      }
+    | { kind: "error"; message: string };
+
+  const [diarizationUi, setDiarizationUi] = useState<DiarizationUi>({ kind: "none" });
+  /** Matches `diarization:done` to the recording the user just saved (same tab). */
+  const diarizationSessionIdRef = useRef<string | null>(null);
+  /** Refetch main `.txt` after AssemblyAI overwrites it (avoid stale cache). */
+  const transcriptUrlRef = useRef<string | null>(null);
 
   const socketRef = useRef<Socket | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -104,15 +159,44 @@ export default function StreamToServer() {
   const sessionIdRef = useRef<string | null>(null);
   const seqRef = useRef(-1);
   const chunkSendChainRef = useRef(Promise.resolve());
-  const transcriptSeqRef = useRef(0);
-  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
-  const recordingActiveRef = useRef(false);
-  /** Mirrors speech results so we can flush interim as `final` on Stop (API often omits finals). */
-  const latestInterimRef = useRef("");
-  const latestCommittedRef = useRef("");
 
   useEffect(() => {
-    setSpeechOk(getSpeechRecognitionCtor() !== null);
+    let cancelled = false;
+    const url = joinApiUrl(env.NEXT_PUBLIC_SERVER_URL, "/capabilities");
+    void fetch(url)
+      .then((r) => {
+        if (!r.ok) {
+          throw new Error(`HTTP ${r.status}`);
+        }
+        return r.json() as Promise<{
+          assemblyAiTranscription?: boolean;
+          speakerDiarization?: boolean;
+        }>;
+      })
+      .then((j) => {
+        if (cancelled) {
+          return;
+        }
+        const on = Boolean(
+          j.assemblyAiTranscription ?? j.speakerDiarization,
+        );
+        setCapabilities({
+          status: "ready",
+          assemblyAiEnabled: on,
+        });
+      })
+      .catch(() => {
+        if (cancelled) {
+          return;
+        }
+        setCapabilities({
+          status: "error",
+          message: `Could not load ${url}. Is the API running?`,
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -150,22 +234,33 @@ export default function StreamToServer() {
         }
         if (phase === "ended") {
           const o = p as {
+            audioSessionId?: string;
             chunkCount?: number;
             savedAudioBytes?: number;
             recordingAudioUrl?: string | null;
             recordingTranscriptUrl?: string;
+            diarizationQueued?: boolean;
           };
           setSocketLine(
             `Done — ${o.chunkCount ?? 0} chunks, ${o.savedAudioBytes ?? 0} bytes saved.`,
           );
           const tPath = o.recordingTranscriptUrl;
-          if (typeof tPath === "string") {
+          const sid =
+            typeof o.audioSessionId === "string" ? o.audioSessionId : "";
+          if (typeof tPath === "string" && sid) {
             const transcriptUrl = joinApiUrl(env.NEXT_PUBLIC_SERVER_URL, tPath);
             const audioUrl = o.recordingAudioUrl
               ? joinApiUrl(env.NEXT_PUBLIC_SERVER_URL, o.recordingAudioUrl)
               : null;
-            setSavedRecording({ audioUrl, transcriptUrl });
+            diarizationSessionIdRef.current = sid;
+            transcriptUrlRef.current = transcriptUrl;
+            setSavedRecording({ audioUrl, transcriptUrl, audioSessionId: sid });
             setSavedTranscriptText(null);
+            if (o.diarizationQueued) {
+              setDiarizationUi({ kind: "pending" });
+            } else {
+              setDiarizationUi({ kind: "none" });
+            }
             void fetch(transcriptUrl)
               .then((r) => {
                 if (!r.ok) {
@@ -196,8 +291,101 @@ export default function StreamToServer() {
       setIsProcessingFinal(false);
       setSocketLine(formatLine(p));
     });
-    socket.on("transcript:error", (p: unknown) => {
-      setSocketLine(formatLine(p));
+
+    socket.on("diarization:done", (raw: unknown) => {
+      if (!raw || typeof raw !== "object") {
+        return;
+      }
+      const d = raw as {
+        audioSessionId?: string;
+        ok?: boolean;
+        error?: string;
+        recordingSpeakersUrl?: string;
+        recordingDiarizationJsonUrl?: string;
+      };
+      if (
+        typeof d.audioSessionId !== "string" ||
+        d.audioSessionId !== diarizationSessionIdRef.current
+      ) {
+        return;
+      }
+      if (d.ok) {
+        const sPath = d.recordingSpeakersUrl;
+        const jPath = d.recordingDiarizationJsonUrl;
+        if (typeof sPath !== "string" || typeof jPath !== "string") {
+          setDiarizationUi({
+            kind: "error",
+            message: "Invalid diarization response from server.",
+          });
+          return;
+        }
+        const speakersUrl = joinApiUrl(env.NEXT_PUBLIC_SERVER_URL, sPath);
+        const jsonUrl = joinApiUrl(env.NEXT_PUBLIC_SERVER_URL, jPath);
+        setDiarizationUi({
+          kind: "ready",
+          speakersUrl,
+          jsonUrl,
+          speakersText: null,
+          segments: null,
+        });
+        void (async () => {
+          const [jsonBody, txtBody] = await Promise.all([
+            fetch(jsonUrl)
+              .then(async (r) => (r.ok ? r.json() : null))
+              .catch(() => null),
+            fetch(speakersUrl)
+              .then(async (r) => (r.ok ? r.text() : null))
+              .catch(() => null),
+          ]);
+
+          const segments =
+            jsonBody !== null ? segmentsFromDiarizationJson(jsonBody) : null;
+
+          let speakersText: string | null = null;
+          if (typeof txtBody === "string") {
+            speakersText =
+              txtBody.trim() === "" ? "(empty diarization)" : txtBody;
+          } else if (!segments?.length) {
+            speakersText =
+              "(Could not load speaker transcript — check API CORS and URL.)";
+          }
+
+          setDiarizationUi((prev) =>
+            prev.kind === "ready" && prev.jsonUrl === jsonUrl
+              ? { ...prev, segments, speakersText }
+              : prev,
+          );
+
+          const tUrl = transcriptUrlRef.current;
+          if (tUrl) {
+            const bust = `${tUrl}${tUrl.includes("?") ? "&" : "?"}t=${Date.now()}`;
+            void fetch(bust)
+              .then((r) => {
+                if (!r.ok) {
+                  throw new Error(String(r.status));
+                }
+                return r.text();
+              })
+              .then((txt) => {
+                const s = txt.trim();
+                setSavedTranscriptText(
+                  s === "" ? "(empty transcript)" : s,
+                );
+              })
+              .catch(() => {
+                /* keep existing placeholder text */
+              });
+          }
+        })();
+      } else {
+        setDiarizationUi({
+          kind: "error",
+          message: d.error ?? "AssemblyAI processing failed.",
+        });
+        setSavedTranscriptText(
+          `(AssemblyAI error: ${d.error ?? "unknown"})`,
+        );
+      }
     });
 
     return () => {
@@ -207,49 +395,9 @@ export default function StreamToServer() {
   }, []);
 
   /**
-   * Stops Web Speech. Before tearing it down, emits one last Socket.IO `transcript` with
-   * `isFinal: true` when there is still interim text (so the server can persist it).
-   */
-  const stopSpeechRecognition = useCallback(() => {
-    const sid = sessionIdRef.current;
-    const sock = socketRef.current;
-    const interimFlush = latestInterimRef.current.trim();
-    if (interimFlush && sid && sock?.connected) {
-      transcriptSeqRef.current += 1;
-      sock.emit("transcript", {
-        audioSessionId: sid,
-        text: interimFlush,
-        isFinal: true,
-        seq: transcriptSeqRef.current,
-      });
-    }
-    latestInterimRef.current = "";
-
-    recordingActiveRef.current = false;
-    const r = recognitionRef.current;
-    recognitionRef.current = null;
-    if (r) {
-      try {
-        r.stop();
-      } catch {
-        try {
-          r.abort();
-        } catch {
-          /* ignore */
-        }
-      }
-    }
-    setInterimTranscript("");
-  }, []);
-
-  /**
-   * Stop order (all Socket.IO → same `audioSessionId` until cleared):
-   * 1. `transcript` (optional final flush) — see stopSpeechRecognition
-   * 2. Last `audio:chunk`(s) from MediaRecorder `stop` / `requestData`
-   * 3. `audio:end` — after in-flight chunk emits finish (recorder.onstop chain)
+   * Stop: last `audio:chunk`(s) from MediaRecorder, then `audio:end` after the emit chain.
    */
   const stop = useCallback(() => {
-    stopSpeechRecognition();
     const rec = recorderRef.current;
     if (rec && rec.state !== "inactive") {
       try {
@@ -274,7 +422,7 @@ export default function StreamToServer() {
       setLocalChunkCount(0);
       setIsProcessingFinal(false);
     }
-  }, [stopSpeechRecognition]);
+  }, []);
 
   const start = useCallback(async () => {
     const socket = socketRef.current;
@@ -290,16 +438,14 @@ export default function StreamToServer() {
       return;
     }
 
-    setCommittedTranscript("");
-    setInterimTranscript("");
-    latestInterimRef.current = "";
-    latestCommittedRef.current = "";
-    transcriptSeqRef.current = 0;
     setChunkCount(0);
     setLocalChunkCount(0);
     setSavedRecording(null);
     setSavedTranscriptText(null);
     setIsProcessingFinal(false);
+    setDiarizationUi({ kind: "none" });
+    diarizationSessionIdRef.current = null;
+    transcriptUrlRef.current = null;
 
     const mimeCandidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"];
     const mimeType = mimeCandidates.find((m) => MediaRecorder.isTypeSupported(m));
@@ -316,78 +462,6 @@ export default function StreamToServer() {
       audioSessionId,
       mimeType,
     });
-
-    const Ctor = getSpeechRecognitionCtor();
-    if (Ctor) {
-      recordingActiveRef.current = true;
-      const recognition = new Ctor();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = navigator.language || "en-US";
-
-      recognition.onresult = (event: SpeechRecognitionEventLike) => {
-        const sid = sessionIdRef.current;
-        const sock = socketRef.current;
-        if (!sid || !sock?.connected) {
-          return;
-        }
-
-        let interim = "";
-        let newFinal = "";
-        for (let i = event.resultIndex; i < event.results.length; i += 1) {
-          const row = event.results[i];
-          const piece = row[0]?.transcript ?? "";
-          if (row.isFinal) {
-            newFinal += piece;
-          } else {
-            interim += piece;
-          }
-        }
-
-        setInterimTranscript(interim);
-        latestInterimRef.current = interim;
-        if (newFinal) {
-          latestCommittedRef.current += newFinal;
-          setCommittedTranscript(latestCommittedRef.current);
-        }
-
-        const textToSend = newFinal || interim;
-        if (textToSend.trim() === "") {
-          return;
-        }
-
-        transcriptSeqRef.current += 1;
-        sock.emit("transcript", {
-          audioSessionId: sid,
-          text: textToSend,
-          isFinal: newFinal.length > 0,
-          seq: transcriptSeqRef.current,
-        });
-      };
-
-      recognition.onerror = (ev: SpeechRecognitionErrorLike) => {
-        setSocketLine(`Speech: ${ev.error}`);
-      };
-
-      recognition.onend = () => {
-        if (recordingActiveRef.current && recognitionRef.current) {
-          try {
-            recognitionRef.current.start();
-          } catch {
-            /* already running */
-          }
-        }
-      };
-
-      recognitionRef.current = recognition;
-      try {
-        recognition.start();
-      } catch (e) {
-        setSocketLine(`Speech start failed: ${e instanceof Error ? e.message : String(e)}`);
-        recognitionRef.current = null;
-        recordingActiveRef.current = false;
-      }
-    }
 
     const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
     recorderRef.current = recorder;
@@ -441,7 +515,7 @@ export default function StreamToServer() {
             lastSeq,
           });
           setSocketLine(
-            "Processing — merging all chunks on the server, writing files, preparing transcript…",
+            "Processing — merging chunks on the server; transcript comes from AssemblyAI when configured…",
           );
         } else if (sid) {
           setIsProcessingFinal(false);
@@ -466,8 +540,6 @@ export default function StreamToServer() {
     setSocketLine(`Recording — chunks every ${CHUNK_INTERVAL_MS / 1000}s (sent to server only).`);
   }, []);
 
-  const hasTranscript = committedTranscript.length > 0 || interimTranscript.length > 0;
-
   const showFinalResult = Boolean(savedRecording && !isProcessingFinal);
 
   return (
@@ -476,37 +548,45 @@ export default function StreamToServer() {
         <CardTitle>Stream to server</CardTitle>
         <CardDescription>
           API: <code className="text-xs">{env.NEXT_PUBLIC_SERVER_URL}</code> — audio chunks every{" "}
-          {CHUNK_INTERVAL_MS / 1000}s. The server buffers and merges them into one file after you
-          stop. Live captions use the Web Speech API (Chrome/Edge).
+          {CHUNK_INTERVAL_MS / 1000}s. After <strong>Stop</strong>, the server merges audio and sends
+          it to <strong>AssemblyAI</strong> for transcription and speaker labels (when the API key is
+          set). There is no live captioning in the browser.
         </CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
-        {!speechOk ? (
-          <p className="text-amber-600 text-sm dark:text-amber-400">
-            Web Speech API not available — audio still streams; use Chrome for transcript.
-          </p>
-        ) : null}
+        <div
+          aria-live="polite"
+          className="rounded-lg border bg-muted/15 px-3 py-2 text-xs leading-relaxed"
+        >
+          <span className="font-medium text-foreground">API features: </span>
+          {capabilities.status === "loading" ? (
+            <span className="text-muted-foreground">Checking…</span>
+          ) : null}
+          {capabilities.status === "error" ? (
+            <span className="text-amber-700 dark:text-amber-400">{capabilities.message}</span>
+          ) : null}
+          {capabilities.status === "ready" ? (
+            <>
+              <span className="text-muted-foreground">AssemblyAI (transcript + speakers) — </span>
+              {capabilities.assemblyAiEnabled ? (
+                <span className="font-medium text-green-700 dark:text-green-400">enabled</span>
+              ) : (
+                <span className="text-muted-foreground">
+                  off (set <code className="text-[11px]">ASSEMBLYAI_API_KEY</code> on the server and
+                  restart)
+                </span>
+              )}
+            </>
+          ) : null}
+        </div>
 
         <div className="rounded-lg border bg-muted/20 p-3">
-          <h3 className="mb-1 font-medium text-sm">Transcript (live)</h3>
-          <p
-            aria-live="polite"
-            className="min-h-16 text-base leading-relaxed text-foreground"
-          >
-            {hasTranscript ? (
-              <>
-                <span>{committedTranscript}</span>
-                {interimTranscript ? (
-                  <span className="text-muted-foreground italic"> {interimTranscript}</span>
-                ) : null}
-              </>
-            ) : streaming ? (
-              <span className="text-muted-foreground">Listening…</span>
-            ) : (
-              <span className="text-muted-foreground text-sm">
-                Start stream and speak — text appears as you talk.
-              </span>
-            )}
+          <h3 className="mb-1 font-medium text-sm">Transcription</h3>
+          <p className="text-muted-foreground text-sm leading-relaxed">
+            Text is <strong>not</strong> shown while you record. After you stop, the merged file is
+            transcribed on the server via AssemblyAI (full text in the{" "}
+            <code className="text-xs">.txt</code> file; per-speaker lines appear below when the key is
+            set).
           </p>
         </div>
 
@@ -514,8 +594,8 @@ export default function StreamToServer() {
           <h3 className="mb-2 font-medium text-sm">Final audio</h3>
           <p className="text-muted-foreground text-sm leading-relaxed">
             There is no preview while recording. Chunks are buffered on the server and merged into
-            one file when you press <strong>Stop</strong>. After that you will see processing, then
-            the final player, links, and saved transcript below.
+            one file when you press <strong>Stop</strong>. Then the API saves audio and runs
+            AssemblyAI when configured.
           </p>
           <p className="mt-3 text-muted-foreground text-xs">
             Chunks captured: {localChunkCount} · Confirmed by server: {chunkCount}
@@ -531,9 +611,15 @@ export default function StreamToServer() {
             <Loader2 aria-hidden className="size-8 animate-spin text-primary" />
             <p className="max-w-md text-center font-medium text-sm">Processing your recording</p>
             <p className="max-w-md text-center text-muted-foreground text-xs leading-relaxed">
-              Merging chunk buffers on the API, writing audio and transcript files, then loading the
-              final text. This usually takes a moment after the last chunk is sent.
+              Merging chunk buffers and saving files on the API. This usually finishes quickly after
+              the last chunk is sent.
             </p>
+            {capabilities.status === "ready" && capabilities.assemblyAiEnabled ? (
+              <p className="max-w-md text-center text-muted-foreground text-xs leading-relaxed">
+                AssemblyAI then transcribes the audio and detects speakers; the main transcript and
+                per-speaker blocks update when that job completes (often slower than the merge).
+              </p>
+            ) : null}
           </div>
         ) : null}
 
@@ -571,11 +657,122 @@ export default function StreamToServer() {
               ) : null}
             </p>
             <div className="rounded-md border bg-background p-3">
-              <p className="mb-1 font-medium text-muted-foreground text-xs">Transcript (from API)</p>
+              <p className="mb-1 font-medium text-muted-foreground text-xs">
+                Full transcript (AssemblyAI, <code className="text-[11px]">.txt</code>)
+              </p>
               <p className="whitespace-pre-wrap text-sm leading-relaxed">
                 {savedTranscriptText ?? "—"}
               </p>
             </div>
+
+            {diarizationUi.kind === "pending" ? (
+              <div
+                aria-busy="true"
+                aria-live="polite"
+                className="mt-3 flex flex-col gap-2 rounded-md border border-dashed border-primary/30 bg-muted/20 p-3"
+              >
+                <div className="flex items-center gap-2 text-sm">
+                  <Loader2 aria-hidden className="size-4 animate-spin text-primary" />
+                  <span className="font-medium">AssemblyAI: transcription &amp; speakers</span>
+                </div>
+                <p className="text-muted-foreground text-xs leading-relaxed">
+                  Running on the server. The full transcript above refreshes when the job finishes;
+                  per-speaker lines appear below.
+                </p>
+              </div>
+            ) : null}
+
+            {diarizationUi.kind === "ready" ? (
+              <div className="mt-3 rounded-md border border-primary/20 bg-background p-3">
+                <p className="mb-2 font-medium text-sm">Per-speaker transcript (AssemblyAI)</p>
+                <p className="mb-2 break-all text-muted-foreground text-xs">
+                  <a
+                    className="text-primary underline"
+                    href={diarizationUi.speakersUrl}
+                    rel="noopener noreferrer"
+                    target="_blank"
+                  >
+                    Speakers (.txt)
+                  </a>
+                  {" · "}
+                  <a
+                    className="text-primary underline"
+                    href={diarizationUi.jsonUrl}
+                    rel="noopener noreferrer"
+                    target="_blank"
+                  >
+                    Full JSON
+                  </a>
+                </p>
+                {diarizationUi.segments && diarizationUi.segments.length > 0 ? (
+                  <>
+                    <p className="mb-3 text-muted-foreground text-xs leading-relaxed">
+                      {(() => {
+                        const n = new Set(
+                          diarizationUi.segments.map((s) => s.speakerNumber),
+                        ).size;
+                        return `Detected ${n} distinct speaker${n === 1 ? "" : "s"}. Each block is one stretch of speech (AssemblyAI may split overlaps into turns).`;
+                      })()}
+                    </p>
+                    <ul className="m-0 flex list-none flex-col gap-2 p-0">
+                      {diarizationUi.segments.map((seg, i) => (
+                        <li
+                          className={cn(
+                            "rounded-lg border p-3",
+                            seg.speakerNumber % 2 === 1
+                              ? "border-primary/20 bg-primary/5"
+                              : "border-border bg-muted/25",
+                          )}
+                          key={`${seg.speakerNumber}-${i}-${seg.timeRangeLabel}`}
+                        >
+                          <p className="text-xs">
+                            <span className="font-semibold text-foreground">
+                              Speaker {seg.speakerNumber} says
+                            </span>
+                            <span className="text-muted-foreground">
+                              {" "}
+                              ({seg.timeRangeLabel})
+                            </span>
+                          </p>
+                          <p className="mt-1.5 text-sm leading-relaxed">
+                            {seg.text}
+                          </p>
+                        </li>
+                      ))}
+                    </ul>
+                  </>
+                ) : null}
+
+                {diarizationUi.segments?.length ? (
+                  <details className="mt-3 rounded-md border bg-muted/10 p-2">
+                    <summary className="cursor-pointer font-medium text-muted-foreground text-xs">
+                      Plain text export (same as .txt file)
+                    </summary>
+                    <p className="mt-2 whitespace-pre-wrap text-xs leading-relaxed">
+                      {diarizationUi.speakersText ?? "Loading…"}
+                    </p>
+                  </details>
+                ) : (
+                  <>
+                    <p className="mb-1 font-medium text-muted-foreground text-xs">
+                      Labeled lines (preview)
+                    </p>
+                    <p className="whitespace-pre-wrap text-sm leading-relaxed">
+                      {diarizationUi.speakersText ?? "Loading…"}
+                    </p>
+                  </>
+                )}
+              </div>
+            ) : null}
+
+            {diarizationUi.kind === "error" ? (
+              <div className="mt-3 rounded-md border border-destructive/40 bg-destructive/5 p-3">
+                <p className="font-medium text-destructive text-sm">AssemblyAI failed</p>
+                <p className="mt-1 text-muted-foreground text-xs leading-relaxed">
+                  {diarizationUi.message}
+                </p>
+              </div>
+            ) : null}
           </div>
         ) : null}
 

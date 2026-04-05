@@ -7,7 +7,10 @@ export const env = createEnv({
     DATABASE_URL: z.string().min(1),
     CORS_ORIGIN: z.url(),
     NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
+    /** Optional — when set, merged recordings are sent to AssemblyAI for speaker diarization. */
+    ASSEMBLYAI_API_KEY: z.string().min(1).optional(),
   },
   runtimeEnv: process.env,
   emptyStringAsUndefined: true,
 });
+
