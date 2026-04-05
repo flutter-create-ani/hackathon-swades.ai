@@ -23,6 +23,13 @@ npm run start:server
 - Web app: [http://localhost:3000](http://localhost:3000)
 - API server: [http://localhost:3001](http://localhost:3001)
 
+### Live deployment
+
+- **Frontend (Netlify):** [https://lambent-griffin-2247b1.netlify.app/recorder](https://lambent-griffin-2247b1.netlify.app/recorder)
+- **Backend API (Railway):** [https://server-production-bab9.up.railway.app/](https://server-production-bab9.up.railway.app/)
+
+For the deployed web app, `NEXT_PUBLIC_SERVER_URL` should match the Railway API base URL above (no trailing slash is fine for the env value).
+
 ### AssemblyAI API key
 
 Merged recordings are transcribed and speaker-labeled on the **API server** via [AssemblyAI](https://www.assemblyai.com/). You need an API key in the server environment:
