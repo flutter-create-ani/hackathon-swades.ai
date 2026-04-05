@@ -1,3 +1,30 @@
+### Run the apps
+
+Build all packages and apps first, then start the web app and API server in separate terminals.
+
+1. **Build** (from the repo root):
+
+```bash
+npm run build
+```
+
+2. **Start the web app** (terminal 1):
+
+```bash
+npm run start:web
+```
+
+3. **Start the API server** (terminal 2):
+
+```bash
+npm run start:server
+```
+
+- Web app: [http://localhost:3000](http://localhost:3000)
+- API server: [http://localhost:3001](http://localhost:3001)
+
+
+
 # Reliable Recording Chunking Pipeline
 
 An assignment for building a reliable chunking setup that ensures recording data stays accurate in all cases — no data loss, no silent failures.
@@ -51,14 +78,9 @@ npm install
 npm run db:push
 ```
 
-### Run Development
 
-```bash
-npm run dev
-```
 
-- Web app: [http://localhost:3000](http://localhost:3000)
-- API server: [http://localhost:3001](http://localhost:3001)
+For local development with hot reload, you can use `npm run dev` instead (runs apps via Turborepo without a prior full build).
 
 ## Load Testing
 
@@ -132,10 +154,12 @@ recoding-assignment/
 
 ## Available Scripts
 
-- `npm run dev` — Start all apps in development mode
-- `npm run build` — Build all apps
-- `npm run dev:web` — Start only the web app
-- `npm run dev:server` — Start only the server
+- `npm run build` — Build all apps (run this before `start:web` / `start:server`)
+- `npm run start:web` — Start the Next.js web app (production build)
+- `npm run start:server` — Start the Hono API server (production build)
+- `npm run dev` — Start all apps in development mode (Turborepo)
+- `npm run dev:web` — Start only the web app in dev mode
+- `npm run dev:server` — Start only the server in dev mode
 - `npm run check-types` — TypeScript type checking
 - `npm run db:push` — Push schema changes to database
 - `npm run db:generate` — Generate database client/types
