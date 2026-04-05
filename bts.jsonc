@@ -1,0 +1,31 @@
+// Better-T-Stack
+//
+// Website: https://www.better-t-stack.dev/
+// Stack Builder: https://www.better-t-stack.dev/new
+// Analytics: https://www.better-t-stack.dev/analytics
+// Showcase: https://www.better-t-stack.dev/showcase
+// Sponsor: https://github.com/sponsors/AmanVarshney01
+//
+// Add new addons with: npx create-better-t-stack add
+// This file is safe to delete
+
+{
+  "$schema": "https://r2.better-t-stack.dev/schema.json",
+  "version": "3.27.0",
+  "createdAt": "2026-04-04T19:37:46.209Z",
+  "reproducibleCommand": "npx create-better-t-stack@latest my-better-t-app --frontend next --backend hono --runtime bun --database postgres --orm drizzle --api none --auth none --payments none --addons turborepo ultracite --examples none --db-setup docker --web-deploy none --server-deploy none --no-git --package-manager npm --install",
+  "database": "postgres",
+  "orm": "drizzle",
+  "backend": "hono",
+  "runtime": "bun",
+  "frontend": ["next"],
+  "addons": ["turborepo", "ultracite"],
+  "examples": [],
+  "auth": "none",
+  "payments": "none",
+  "packageManager": "npm",
+  "dbSetup": "docker",
+  "api": "none",
+  "webDeploy": "none",
+  "serverDeploy": "none",
+}

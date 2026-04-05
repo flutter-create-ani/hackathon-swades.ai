@@ -1,0 +1,43 @@
+{
+  "name": "my-better-t-app",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "type": "module",
+  "scripts": {
+    "dev": "turbo dev",
+    "build": "turbo build",
+    "check-types": "turbo check-types",
+    "dev:web": "turbo -F web dev",
+    "dev:server": "turbo -F server dev",
+    "start:web": "npm run start -w web",
+    "start:server": "npm run start -w server",
+    "db:push": "turbo -F @my-better-t-app/db db:push",
+    "db:studio": "turbo -F @my-better-t-app/db db:studio",
+    "db:generate": "turbo -F @my-better-t-app/db db:generate",
+    "db:migrate": "turbo -F @my-better-t-app/db db:migrate",
+    "db:start": "turbo -F @my-better-t-app/db db:start",
+    "db:watch": "turbo -F @my-better-t-app/db db:watch",
+    "db:stop": "turbo -F @my-better-t-app/db db:stop",
+    "db:down": "turbo -F @my-better-t-app/db db:down",
+    "check": "ultracite check",
+    "fix": "ultracite fix"
+  },
+  "dependencies": {
+    "@my-better-t-app/env": "*",
+    "dotenv": "^17.2.2",
+    "zod": "^4.1.13"
+  },
+  "devDependencies": {
+    "@my-better-t-app/config": "*",
+    "@types/bun": "^1.3.4",
+    "oxfmt": "latest",
+    "oxlint": "latest",
+    "turbo": "^2.8.12",
+    "typescript": "^5",
+    "ultracite": "7.4.3"
+  },
+  "packageManager": "npm@10.9.4"
+}

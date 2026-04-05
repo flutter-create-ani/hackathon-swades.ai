@@ -1,0 +1,30 @@
+{
+  "name": "server",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "build": "tsdown",
+    "check-types": "tsc -b",
+    "compile": "bun build --compile --minify --sourcemap --bytecode ./src/index.ts --outfile server",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.mjs"
+  },
+  "dependencies": {
+    "@my-better-t-app/db": "*",
+    "@my-better-t-app/env": "*",
+    "cors": "^2.8.6",
+    "dotenv": "^17.2.2",
+    "express": "^5.2.1",
+    "socket.io": "^4.8.3",
+    "zod": "^4.1.13"
+  },
+  "devDependencies": {
+    "@my-better-t-app/config": "*",
+    "@types/bun": "^1.3.4",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "tsdown": "^0.16.5",
+    "tsx": "^4.21.0",
+    "typescript": "^5"
+  }
+}
